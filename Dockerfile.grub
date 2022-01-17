@@ -1,0 +1,12 @@
+FROM opensuse/leap as grub-base
+
+RUN zypper update && zypper install -y grub2 grub2-arm64-efi
+
+COPY grub/grubmodules.txt modules.txt
+COPY grub/sbat.csv sbat.csv
+
+RUN mkdir -p /EFI/BOOT
+RUN grub2-mkimage -O arm64-efi -o /EFI/BOOT/bootaa64.efi --prefix= --sbat sbat.csv $(cat modules.txt)
+
+FROM scratch as output
+COPY --from=grub-base /EFI/BOOT/ /
