@@ -1,0 +1,66 @@
+FROM debian:sid AS kernel
+
+ENV DEBIAN_FRONTEND noninteractive
+ENV DEBCONF_NONINTERACTIVE_SEEN true
+
+## preesed tzdata, update package index, upgrade packages and install needed software
+RUN truncate -s0 /tmp/preseed.cfg; \
+    echo "tzdata tzdata/Areas select Europe" >> /tmp/preseed.cfg; \
+    echo "tzdata tzdata/Zones/Europe select Berlin" >> /tmp/preseed.cfg; \
+    debconf-set-selections /tmp/preseed.cfg && \
+    rm -f /etc/timezone /etc/localtime
+
+RUN set -ex;                                   \
+    apt update;                                \
+    apt install -y                             \
+        git                                    \
+        python3                                \
+        net-tools                              \
+        nmap                                   \
+        software-properties-common             \
+        ssh                                    \
+        sshpass                                \
+        tar                                    \
+        wget                                   \
+        xz-utils;                              \
+    apt install -y                             \
+        kmod                                   \
+        build-essential                        \
+        ccache                                 \
+        bison                                  \
+        flex                                   \
+        bc                                     \
+        libssl-dev                             \
+        cpio                                   \
+        rsync                                  \
+        gcc-aarch64-linux-gnu;                 \
+    apt install -y                             \
+        autoconf                               \
+        pkg-config                             \
+        autopoint;
+
+RUN mkdir -p /build
+RUN mkdir -p /output
+WORKDIR /build
+
+COPY aarch64-linux/ /build/linux
+
+WORKDIR /build/linux
+
+RUN mkdir -p /buildCache
+RUN mkdir -p /out
+VOLUME /buildCache
+
+COPY kernel/armKernel.config /build/.config
+
+RUN CCACHE_DIR=/buildCache ccache make -j $(nproc)                          \
+	ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+  LOCALVERSION="-custom"
+
+RUN CCACHE_DIR=/buildCache ccache make -j $(nproc)                          \
+	ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+  LOCALVERSION="-custom"                      \
+  dtbs
+
+FROM scratch AS output
+COPY --from=kernel /build/linux/arch/arm64/boot/ /
