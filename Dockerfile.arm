@@ -1,0 +1,131 @@
+FROM debian:sid AS baseimage
+
+ENV DEBIAN_FRONTEND noninteractive
+ENV DEBCONF_NONINTERACTIVE_SEEN true
+
+## preesed tzdata, update package index, upgrade packages and install needed software
+RUN truncate -s0 /tmp/preseed.cfg; \
+    echo "tzdata tzdata/Areas select Europe" >> /tmp/preseed.cfg; \
+    echo "tzdata tzdata/Zones/Europe select Berlin" >> /tmp/preseed.cfg; \
+    debconf-set-selections /tmp/preseed.cfg && \
+    rm -f /etc/timezone /etc/localtime
+
+RUN set -ex;                                   \
+    apt update;                                \
+    apt install -y                             \
+        git                                    \
+        python3                                \
+        tar                                    \
+        wget                                   \
+        xz-utils;                              \
+    apt install -y                             \
+        kmod                                   \
+        build-essential                        \
+        ccache                                 \
+        bison                                  \
+        flex                                   \
+        bc                                     \
+        libssl-dev                             \
+        cpio                                   \
+        rsync                                  \
+        gcc-aarch64-linux-gnu;                 \
+    apt install -y                             \
+        autoconf                               \
+        pkg-config                             \
+        vlan                                   \
+        autopoint;
+
+FROM baseimage AS kernel-wedge
+
+RUN mkdir -p /build/debian-cdimage/kernel-wedge
+
+WORKDIR /build
+RUN apt install -y kernel-wedge
+COPY debian-cdimage/kernel-wedge /build/debian-cdimage/kernel-wedge
+COPY kernelOutput.tar /build
+RUN cd /build && tar -xvf kernelOutput.tar && dpkg -i /build/linux-image-5.15.0-custom_5.15.0-custom-1_arm64.deb
+
+WORKDIR /build/debian-cdimage/kernel-wedge/linux-kernel-di-arm64
+RUN KW_DEFCONFIG_DIR=/build/debian-cdimage/kernel-wedge/linux-kernel-di-arm64 kernel-wedge gen-control > debian/control
+RUN KW_DEFCONFIG_DIR=/build/debian-cdimage/kernel-wedge/linux-kernel-di-arm64 kernel-wedge build-arch arm64
+
+FROM baseimage as debian-installer
+
+RUN mkdir -p /build/debian-cdimage/simple-cdd && mkdir -p /build/debian-cdimage/patches/grub-installer
+
+RUN echo "deb-src http://deb.debian.org/debian sid main" >> /etc/apt/sources.list
+RUN apt update \
+    && apt install -y mr \
+    && apt build-dep -y debian-installer grub-installer
+
+# Add to localpackages
+COPY debian-cdimage/patches/debian-installer/grub-installer/0001-grub-installer-no-nvram-for-arm64.patch /build/debian-cdimage/patches/debian-installer/grub-installer/0001-grub-installer-no-nvram-for-arm64.patch
+COPY debian-cdimage/simple-cdd /build/debian-cdimage/simple-cdd
+COPY kernelOutput.tar /build/debian-cdimage/simple-cdd/localpackages/
+RUN cd /build/debian-cdimage/simple-cdd/localpackages/ && tar -xvf kernelOutput.tar
+
+# DEBIAN INSTALLER
+WORKDIR /build/debian-cdimage
+RUN git clone https://salsa.debian.org/installer-team/d-i.git debian-installer
+
+WORKDIR /build/debian-cdimage/debian-installer
+RUN scripts/git-setup || true
+RUN mr checkout
+
+# apply patch for nvram
+WORKDIR /build/debian-cdimage/debian-installer/packages/grub-installer
+RUN git config --global user.email "floris@nusunt.eu" \
+    && git config --global user.name "Floris Stoica" \
+    && git am
+RUN dpkg-buildpackage -b
+
+# copy installer udebs
+WORKDIR /build/debian-cdimage/debian-installer/packages
+RUN cp grub-installer_*_arm64.udeb /build/debian-cdimage/simple-cdd/localpackages/
+
+# copy kernel udebs
+WORKDIR /build/debian-cdimage/debian-installer/installer/build
+COPY --from=kernel-wedge /build/debian-cdimage/kernel-wedge/*.udeb localudebs/
+RUN echo "deb http://deb.debian.org/debian sid main/debian-installer" >> sources.list.udeb.local
+RUN echo "deb [trusted=yes] copy:$PWD localudebs/" >> sources.list.udeb.local
+
+# modify configs
+RUN sed -i "s/-arm64/-custom/g" config/arm64.cfg
+RUN sed -i "s/EFI_SIGNED=y/#EFI_SIGNED=y/g" config/arm64.cfg
+
+# build debian installer
+RUN make LINUX_KERNEL_ABI=5.15.0 build_cdrom_grub
+RUN make LINUX_KERNEL_ABI=5.15.0 build_cdrom_gtk
+
+FROM debian-installer as iso-builder
+
+RUN mkdir -p /build/debian-cdimage/patches/simple-cdd
+COPY debian-cdimage/patches/simple-cdd/0002-Update-default.preseed-for-aarch64-laptops-build.patch /build/debian-cdimage/patches/simple-cdd/0002-Update-default.preseed-for-aarch64-laptops-build.patch
+
+# DEBIAN CD IMAGE
+RUN apt install -y simple-cdd
+WORKDIR /usr/share/simple-cdd
+RUN patch -p1 < /build/debian-cdimage/patches/simple-cdd/0002-Update-default.preseed-for-aarch64-laptops-build.patch
+
+WORKDIR /build/debian-cdimage/simple-cdd
+RUN mkdir -p debian/installer/arm64/images/
+COPY --from=debian-installer /build/debian-cdimage/debian-installer/installer/build/dest/ debian/installer/arm64/images/
+
+# pack efi image
+RUN mkdir -p /build/debian-cdimage/simple-cdd/misc
+COPY debian-cdimage/simple-cdd/misc /build/debian-cdimage/simple-cdd/misc
+RUN misc/pack_shell_efi.sh
+
+# copy kernel udebs
+COPY --from=kernel-wedge /build/debian-cdimage/kernel-wedge/*.udeb localpackages/
+
+# update gnome profiles
+COPY debian-cdimage/simple-cdd/profiles /build/debian-cdimage/simple-cdd/profiles
+RUN echo "local_packages=\"$PWD/localpackages\"" >> profiles/gnome.conf
+RUN echo "custom_installer=\"$PWD/debian/installer\"" >> profiles/gnome.conf
+
+# build iso
+RUN build-simple-cdd --force-root --dvd --profiles gnome
+
+FROM scratch AS output
+COPY --from=iso-builder /build/debian-cdimage/simple-cdd/images/*.iso /
